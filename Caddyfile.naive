@@ -1,0 +1,37 @@
+# ============================================================
+# Caddyfile 示例 1：仅 NaiveProxy（klzgrad/forwardproxy@naive）
+# 编译：
+#   xcaddy build \
+#     --with github.com/caddyserver/forwardproxy=github.com/klzgrad/forwardproxy@naive
+# 启动：
+#   ./caddy run --config Caddyfile.naive --adapter caddyfile
+# 客户端（naive）：proxy=https://你的用户名:你的密码@naive.example.com
+# ============================================================
+{
+	# forward_proxy 默认排在 file_server 之后，这里显式提前
+	order forward_proxy before file_server
+
+	# 不记录用户访问日志，避免泄露代理活动
+	log {
+		exclude http.log.error
+	}
+}
+
+# 注意：:443 必须写在地址的第一位，
+# 否则 forward_proxy 只处理本站点域名的请求，无法作为通用代理使用
+:443, naive.example.com {
+	tls admin@example.com
+	encode
+
+	forward_proxy {
+		basic_auth your_user your_password
+		hide_ip
+		hide_via
+		probe_resistance
+	}
+
+	# 未携带正确代理凭据的请求会落到这里，表现为一个普通网站
+	file_server {
+		root /var/www/html
+	}
+}

@@ -1,0 +1,119 @@
+name: Check upstream versions
+
+on:
+  schedule:
+    # 每天 02:00（Asia/Shanghai）检查一次
+    - cron: "0 18 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: write
+
+# 流程：解析上游最新版本 → 在 Release 中查找带该版本隐藏标记的发布，并确认其至少有一个产物 →
+# 找不到（或产物被删）时触发 build-caddy.yml 自动构建
+# 以 Release 实际状态为准，不依赖 actions 缓存：即使缓存仍命中，只要 Release/产物被删除也会重新发布
+# 最后用 Mattraks/delete-workflow-runs 清理运行记录：每个 workflow 只保留最近 1 次，避免每日计划任务无限累积
+# 自动构建的 Release 标签格式：caddy_<caddy 版本>_<日期>，如 caddy_v2.11.7_20261110
+
+jobs:
+  check-and-trigger:
+    name: Check and trigger build
+    runs-on: ubuntu-latest
+    steps:
+      # 1. 解析 klzgrad/forwardproxy 的最新 release 及配套 caddy 版本，
+      #    以及 caddy-trojan 在 Go 模块代理上的最新版本（与构建时 go get 解析结果一致）
+      - name: Resolve upstream versions
+        id: upstream
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          NAIVE_REF="$(gh api repos/klzgrad/forwardproxy/releases/latest --jq .tag_name)"
+          CADDY_VERSION="$(curl -fsSL "https://raw.githubusercontent.com/klzgrad/forwardproxy/${NAIVE_REF}/CADDY_VERSION")"
+          TROJAN_VERSION="$(curl -fsSL "https://proxy.golang.org/github.com/imgk/caddy-trojan/@latest" | jq -r .Version)"
+          {
+            echo "naive_ref=${NAIVE_REF}"
+            echo "caddy_version=${CADDY_VERSION}"
+            echo "trojan_version=${TROJAN_VERSION}"
+          } >> "$GITHUB_OUTPUT"
+          echo "naive: ${NAIVE_REF}, caddy: ${CADDY_VERSION}, caddy-trojan: ${TROJAN_VERSION}"
+
+      # 2. 判断该版本是否已发布：必须同时满足
+      #    ① 存在带该版本隐藏标记的 Release；② 该 Release 至少包含一个产物。
+      #    不再以 actions 缓存作为“已构建”的唯一依据，避免缓存命中但 Release/产物已被删除时不再发布。
+      - name: Look up release state
+        id: release_state
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          WANT="<!-- upstream naive=${{ steps.upstream.outputs.naive_ref }} trojan=${{ steps.upstream.outputs.trojan_version }} -->"
+          TAG_FOUND="$(gh api "repos/${GITHUB_REPOSITORY}/releases?per_page=100" \
+            | jq -r --arg want "${WANT}" '[.[] | select(.body != null and (.body | contains($want)))] | .[0].tag_name // ""')"
+          if [ -z "${TAG_FOUND}" ]; then
+            echo "built=false" >> "$GITHUB_OUTPUT"
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            echo "未找到记录该版本的 Release：${WANT}"
+            exit 0
+          fi
+          ASSETS="$(gh release view "${TAG_FOUND}" --repo "${GITHUB_REPOSITORY}" --json assets --jq '.assets | length')"
+          if [ "${ASSETS}" -gt 0 ]; then
+            echo "built=true" >> "$GITHUB_OUTPUT"
+            echo "tag=" >> "$GITHUB_OUTPUT"
+            echo "Release ${TAG_FOUND} 已存在且含 ${ASSETS} 个产物，跳过"
+          else
+            # 复用该标签重新构建，由 build-caddy.yml 上传产物补齐
+            echo "built=false" >> "$GITHUB_OUTPUT"
+            echo "tag=${TAG_FOUND}" >> "$GITHUB_OUTPUT"
+            echo "Release ${TAG_FOUND} 存在但没有产物，将重新构建补齐"
+          fi
+
+      - name: Report result
+        run: |
+          if [ "${{ steps.release_state.outputs.built }}" = "true" ]; then
+            echo "该版本已发布且产物完整，跳过"
+          else
+            echo "该版本未发布（或产物缺失），准备触发构建"
+          fi
+
+      # 3. 未发布（或产物缺失）则确定标签并触发构建：
+      #    产物缺失时复用原标签补齐，否则使用 caddy_<版本>_<日期>
+      - name: Trigger build
+        if: steps.release_state.outputs.built != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.release_state.outputs.tag }}"
+          if [ -n "${TAG}" ]; then
+            echo "Release ${TAG} 存在但缺少产物，复用该标签重新构建"
+          else
+            TAG="caddy_${{ steps.upstream.outputs.caddy_version }}_$(TZ=Asia/Shanghai date +%Y%m%d)"
+            if gh release view "${TAG}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1; then
+              echo "Release ${TAG} 已存在，跳过触发"
+              exit 0
+            fi
+          fi
+          echo "触发构建，Release 标签：${TAG}"
+          gh workflow run build-caddy.yml \
+            --repo "${GITHUB_REPOSITORY}" \
+            --ref "${GITHUB_REF_NAME}" \
+            -f "release_tag=${TAG}"
+
+      # 4. 清理本仓库所有 workflow 的历史运行记录：每个 workflow 只保留最近 1 次。
+      #    使用 always() 保证即使前面的版本检查/触发构建失败也会执行清理。
+      - name: Delete old workflow runs
+        if: always()
+        uses: Mattraks/delete-workflow-runs@v2
+        with:
+          token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          # 所有 workflow（含已删除 workflow 遗留的运行记录）
+          delete_workflow_by_state_pattern: ALL
+          # 所有结论（success/failure/cancelled/...）
+          delete_run_by_conclusion_pattern: ALL
+          # 不限保留天数，但每个 workflow 至少保留最近 1 次；omit delete_workflow_pattern 表示不限 workflow
+          retain_days: 0
+          keep_minimum_runs: 1
+          dry_run: false

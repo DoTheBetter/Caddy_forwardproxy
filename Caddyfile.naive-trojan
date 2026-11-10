@@ -1,0 +1,88 @@
+# ============================================================
+# Caddyfile 示例 3：NaiveProxy + Trojan 共存，并作为 Xray/V2Ray 的前置 web 服务器
+# 编译：
+#   xcaddy build \
+#     --with github.com/caddyserver/forwardproxy=github.com/klzgrad/forwardproxy@naive \
+#     --with github.com/imgk/caddy-trojan
+# 启动：
+#   ./caddy run --config Caddyfile.naive-trojan --adapter caddyfile
+# ============================================================
+{
+	order forward_proxy before file_server
+	order trojan before file_server
+
+	# 不记录用户访问日志，避免泄露代理活动
+	log {
+		exclude http.log.error
+	}
+
+	# Trojan 需要监听器 wrapper；NaiveProxy 走标准 HTTP/2 CONNECT，无需 wrapper
+	servers :443 {
+		listener_wrappers {
+			trojan
+		}
+	}
+
+	trojan {
+		# upstream：用户（密码）及流量统计存入 Caddy 存储（默认本地文件）
+		caddy
+		# proxy：Trojan 流量直连目标，不经过上游代理
+		no_proxy
+		users your_trojan_password
+	}
+}
+
+# ---------- NaiveProxy 站点 ----------
+# :443 必须放在第一位，forward_proxy 才能代理任意目标
+:443, naive.example.com {
+	tls admin@example.com
+
+	forward_proxy {
+		basic_auth your_user your_password
+		hide_ip
+		hide_via
+		probe_resistance
+	}
+
+	file_server {
+		root /var/www/html
+	}
+}
+
+# ---------- Trojan 站点 ----------
+# 这里不用写成 ":443, trojan.example.com"：:443 兜底地址已由上方 naive 站点声明，
+# 本块只需按主机名匹配（更具体的 host 规则优先于兜底地址）。
+# Trojan 的普通流量由 :443 监听器上的 trojan wrapper 接管，不依赖站点地址。
+trojan.example.com:443 {
+	tls admin@example.com
+
+	trojan {
+		connect_method
+		websocket
+	}
+
+	file_server {
+		root /var/www/html
+	}
+}
+
+# ---------- Xray/V2Ray 前置伪装站点 ----------
+xray.example.com:443 {
+	tls admin@example.com
+	encode gzip
+
+	# 节点路径；handle_path 会去掉该前缀，
+	# 因此 Xray 侧 ws 路径应设为 /（若想保留前缀请改用 handle）
+	handle_path /your_ws_path {
+		# Xray 监听的内部端口
+		reverse_proxy 127.0.0.1:40947
+	}
+
+	# 其余请求反向代理到一个正常网站，作为伪装
+	handle {
+		reverse_proxy https://www.example.org {
+			trusted_proxies 0.0.0.0/0
+			header_up Host {upstream_hostport}
+		}
+	}
+}

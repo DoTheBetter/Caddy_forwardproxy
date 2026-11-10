@@ -1,0 +1,43 @@
+# ============================================================
+# Caddyfile 示例 2：仅 Trojan（imgk/caddy-trojan）
+# 编译：
+#   xcaddy build --with github.com/imgk/caddy-trojan
+# 启动：
+#   ./caddy run --config Caddyfile.trojan --adapter caddyfile
+# 客户端（trojan）：服务器 trojan.example.com，端口 443，密码 your_trojan_password
+# ============================================================
+{
+	order trojan before file_server
+
+	# Trojan 不是标准 HTTP 流量，需要在 443 监听器上挂一层 wrapper 识别并接管
+	servers :443 {
+		listener_wrappers {
+			trojan
+		}
+	}
+
+	trojan {
+		# upstream：用户（密码）及流量统计存入 Caddy 存储（默认本地文件），
+		# 也可改为 memory 仅放内存
+		caddy
+		# proxy：Trojan 流量直连目标，不经过任何上游代理
+		no_proxy
+		# Trojan 密码，可写多个
+		users your_trojan_password
+	}
+}
+
+# 官方示例写法为 :443, example.com；:443 必须写在第一位
+:443, trojan.example.com {
+	tls admin@example.com
+
+	# 同时支持 Trojan 的 CONNECT 方式与 WebSocket 方式
+	trojan {
+		connect_method
+		websocket
+	}
+
+	file_server {
+		root /var/www/html
+	}
+}

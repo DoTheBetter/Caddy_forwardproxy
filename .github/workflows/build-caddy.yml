@@ -1,0 +1,153 @@
+name: Build Caddy (naive + trojan)
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "手动运行时的 Release 标签（留空则使用 nightly-<当前日期>）"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+# 流程：解析版本 → 取源码 → 打补丁 → 编译 → 校验 → 打包 → 发布
+# Release 在编译、校验、打包全部成功后才创建，编译失败不会产生空 Release
+# naive 版本（插件 tag 与配套 caddy 版本）动态取自 klzgrad/forwardproxy 最新 release
+# 仅构建 linux/amd64
+
+jobs:
+  build-and-release:
+    name: Build then release
+    runs-on: ubuntu-latest
+    steps:
+      # 1. 解析上游 naive 版本：最新 release tag 及其配套的 caddy 版本
+      - name: Resolve naive version
+        id: naive
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          REF="$(gh api repos/klzgrad/forwardproxy/releases/latest --jq .tag_name)"
+          VERSION="$(curl -fsSL "https://raw.githubusercontent.com/klzgrad/forwardproxy/${REF}/CADDY_VERSION")"
+          echo "ref=${REF}" >> "$GITHUB_OUTPUT"
+          echo "caddy_version=${VERSION}" >> "$GITHUB_OUTPUT"
+          echo "naive ref: ${REF}, caddy version: ${VERSION}"
+
+      # 2. 解析本次 Release 标签，并据此确定产物名
+      - name: Resolve release tag
+        id: release
+        env:
+          INPUT_TAG: ${{ github.event.inputs.release_tag }}
+        run: |
+          if [ -n "${INPUT_TAG}" ]; then
+            TAG="${INPUT_TAG}"
+          else
+            TAG="nightly-$(TZ=Asia/Shanghai date +%Y%m%d)"
+          fi
+          echo "release_tag=${TAG}" >> "$GITHUB_OUTPUT"
+          echo "BUNDLE=${TAG}-linux-amd64" >> "$GITHUB_ENV"
+          echo "Release tag: ${TAG}"
+
+      # 3. 检出 naive fork（提供补丁文件与 forward_proxy 插件源码）
+      - name: Checkout naive fork
+        uses: actions/checkout@v7
+        with:
+          repository: klzgrad/forwardproxy
+          ref: ${{ steps.naive.outputs.ref }}
+          path: forwardproxy
+
+      # 4. 检出与 naive 配套的 caddy 源码
+      - name: Checkout caddy
+        uses: actions/checkout@v7
+        with:
+          repository: caddyserver/caddy
+          ref: ${{ steps.naive.outputs.caddy_version }}
+          path: .caddy-patched
+
+      # 5. 给 caddy 打官方两个补丁（sing-quic BBRv1 拥塞控制、idle timeout override）
+      - name: Apply patches
+        run: |
+          git -C .caddy-patched apply \
+            "$GITHUB_WORKSPACE/forwardproxy/caddy-sing-quic-bbrv1.patch" \
+            "$GITHUB_WORKSPACE/forwardproxy/caddy-read-idle-timeout.patch"
+
+      # 6. 校验补丁确实生效：工作区文件改动 + 关键内容标记
+      - name: Verify patches
+        run: |
+          git -C .caddy-patched status --short
+          test -f .caddy-patched/modules/caddyhttp/idletimeout.go
+          grep -q 'github.com/sagernet/sing-quic' .caddy-patched/go.mod
+          grep -q 'sing-quic BBRv1' .caddy-patched/modules/caddyhttp/server.go
+
+      # 7. 安装 Go（naive 与 caddy-trojan 均要求 ≥1.26）
+      - name: Setup Go
+        uses: actions/setup-go@v7
+        with:
+          go-version: "^1.26.x"
+          check-latest: true
+
+      # 8. 安装 xcaddy
+      - name: Install xcaddy
+        run: go install github.com/caddyserver/xcaddy/cmd/xcaddy@latest
+
+      # 9. 编译：打过补丁的本地 caddy + naive（官方 --with 写法）+ trojan
+      - name: Build
+        run: |
+          xcaddy build "${{ steps.naive.outputs.caddy_version }}" \
+            --replace "github.com/caddyserver/caddy/v2=${GITHUB_WORKSPACE}/.caddy-patched" \
+            --with "github.com/caddyserver/forwardproxy=github.com/klzgrad/forwardproxy@naive" \
+            --with "github.com/imgk/caddy-trojan" \
+            --output caddy
+
+      # 10. 校验 4 个模块、二进制内的补丁标记，并打印版本
+      - name: Verify modules
+        run: |
+          ./caddy list-modules | awk '/^(trojan|caddy\.listeners\.trojan|http\.handlers\.trojan)$/{print; n++} END{exit n==3?0:1}'
+          ./caddy list-modules | grep -x 'http.handlers.forward_proxy'
+          strings caddy | grep -m1 -o 'sing-quic BBRv1'
+          ./caddy version
+          TROJAN_VERSION="$(go version -m ./caddy | awk '$2=="github.com/imgk/caddy-trojan"{print $3; exit}')"
+          test -n "${TROJAN_VERSION}"
+          echo "TROJAN_VERSION=${TROJAN_VERSION}" >> "$GITHUB_ENV"
+          echo "caddy-trojan build version: ${TROJAN_VERSION}"
+
+      # 11. 打包：只保留编译出的 caddy 二进制，打包为 tar 并输出到 dist
+      - name: Pack
+        run: |
+          set -euo pipefail
+          mkdir -p "${BUNDLE}" dist
+          cp caddy "${BUNDLE}/"
+          tar -cf "dist/${BUNDLE}.tar" "${BUNDLE}"
+
+      # 12. 编译成功后才创建 Release（已存在则跳过）
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view "${{ steps.release.outputs.release_tag }}" --repo "${GITHUB_REPOSITORY}" >/dev/null 2>&1 \
+            || gh release create "${{ steps.release.outputs.release_tag }}" --repo "${GITHUB_REPOSITORY}" \
+                 --title "${{ steps.release.outputs.release_tag }}" \
+                 --notes "Caddy 版本：${{ steps.naive.outputs.caddy_version }}（已打官方 naive 补丁）
+          naive 版本：${{ steps.naive.outputs.ref }}
+          caddy-trojan 版本：${TROJAN_VERSION}
+
+          内置模块：\`http.handlers.forward_proxy\`、\`caddy.listeners.trojan\`、\`http.handlers.trojan\`
+
+          安装：解压后执行 \`install -m755 caddy /usr/local/bin/\`，绑定 443 需 root 或 \`setcap cap_net_bind_service=+ep /usr/local/bin/caddy\`。Caddyfile 示例见仓库根目录的说明文档。
+
+          <!-- upstream naive=${{ steps.naive.outputs.ref }} trojan=${TROJAN_VERSION} -->"
+
+      # 13. 上传产物到 Release
+      - name: Upload to release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release upload "${{ steps.release.outputs.release_tag }}" dist/* --clobber --repo "${GITHUB_REPOSITORY}"
+
+      # 14. 同时存档为 workflow artifact，便于不依赖 Release 直接下载
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: ${{ env.BUNDLE }}
+          path: dist/*
+          if-no-files-found: error

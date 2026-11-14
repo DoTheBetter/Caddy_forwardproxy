@@ -11,7 +11,8 @@
 #   2. 随机化 SSH 端口（兼容 ssh.socket 激活），允许 root 密码登录
 #      fail2ban 防暴力破解，并追加 MaxAuthTries 等认证加固
 #   3. 安装并启用 UFW：默认拒绝入站，仅放行 SSH / 80 / 443（TCP+UDP）
-#   4. 启用 BBR + 常用内核网络加固参数
+#   4. 内核网络加固，并按 naiveproxy 官方 Performance-Tuning 建议调优
+#      （BBR、tcp_wmem 发送窗口、关闭 slow_start_after_idle、tcp_notsent_lowat、禁用 TFO）
 #   5. 配置系统自动更新（不自动重启）
 #
 # 用法：bash install-caddy.sh（无参数）
@@ -144,7 +145,18 @@ net.ipv6.conf.all.accept_redirects = 0
 net.ipv6.conf.default.accept_redirects = 0
 net.core.somaxconn = 4096
 net.ipv4.tcp_max_syn_backlog = 8192
-net.ipv4.tcp_fastopen = 3
+# naiveproxy 官方调优建议：不启用 TCP Fast Open
+net.ipv4.tcp_fastopen = 0
+
+# ---- naiveproxy 性能调优（服务端，参考 klzgrad/naiveproxy Performance-Tuning）----
+# 大带宽高延迟链路（如 1Gbps、RTT 256ms）需要更大的发送窗口，
+# 默认上限仅 4MB，不足以跑满带宽
+net.ipv4.tcp_wmem = 4096 131072 67108864
+# 关闭空闲后慢启动，提升 HTTP/2 长连接性能
+net.ipv4.tcp_slow_start_after_idle = 0
+# 优化发送缓冲处理以降低交互延迟（官方建议 16KB~128KB）；
+# 若大文件下载吞吐明显下降，可注释本行
+net.ipv4.tcp_notsent_lowat = 131072
 EOF
 
     local available
@@ -167,8 +179,16 @@ EOF
     fi
 
     if ! sysctl --system >/dev/null 2>&1; then
-        warn "部分 sysctl 参数应用失败（容器环境常见），请检查 $HARDEN_SYSCTL"
+        warn "部分 sysctl 参数应用失败（容器环境或不支持的内核键常见），请检查 $HARDEN_SYSCTL"
     fi
+
+    # 逐项确认 naiveproxy 调优参数是否真正生效（旧内核可能缺少个别键）
+    local key
+    for key in net.ipv4.tcp_wmem net.ipv4.tcp_slow_start_after_idle net.ipv4.tcp_notsent_lowat; do
+        if [ -z "$(sysctl -n "$key" 2>/dev/null)" ]; then
+            warn "当前内核不支持 ${key}，该项已跳过"
+        fi
+    done
 
     if [ -f "$BBR_SYSCTL" ]; then
         local current
@@ -703,6 +723,7 @@ ExecStart=/usr/local/bin/caddy run --environ --config /etc/caddy/Caddyfile
 ExecReload=/usr/local/bin/caddy reload --config /etc/caddy/Caddyfile --force
 TimeoutStopSec=5s
 LimitNOFILE=1048576
+LimitNPROC=512
 PrivateTmp=true
 ProtectSystem=full
 ProtectHome=true
@@ -719,7 +740,13 @@ install_caddy() {
     log "安装 Caddy"
 
     if ! id caddy >/dev/null 2>&1; then
-        useradd --system --home-dir "$CADDY_HOME" --shell /usr/sbin/nologin --user-group caddy
+        useradd --system \
+            --home-dir "$CADDY_HOME" \
+            --create-home \
+            --shell /usr/sbin/nologin \
+            --comment "Caddy web server" \
+            --user-group \
+            caddy
     fi
     install -d -m 0750 -o root  -g caddy /etc/caddy
     install -d -m 0750 -o caddy -g caddy "$CADDY_HOME" "$CADDY_LOG_DIR"
